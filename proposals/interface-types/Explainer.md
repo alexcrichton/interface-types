@@ -25,6 +25,8 @@ as the [`let`] instruction of the [function references] proposal.
       3. [Lists](#lifting-and-lowering-lists)
       4. [Records](#lifting-and-lowering-records)
       5. [Variants](#lifting-and-lowering-variants)
+      6. [Handles](#lifting-and-lowering-handles)
+      7. [Buffers](#lifting-and-lowering-buffers)
 4. [An End-to-End Example](#an-end-to-end-example)
 5. [Adapter Fusion](#adapter-fusion)
 6. [Use Cases Revisited](#use-cases-revisited)
@@ -40,7 +42,7 @@ to implement its own high-level types efficiently in terms of the low-level
 types. However, when modules from multiple languages need to communicate with
 each other or the host, there remains the question of how to exchange
 high-level values.
- 
+
 To help motivate the proposed solution, we consider 4 use cases. After the
 proposal is introduced, the use cases are [revisited below](#use-cases-revisited).
 
@@ -182,6 +184,9 @@ intertype ::= f32 | f64
             | (list <intertype>)
             | (record (field <name> <id>? <intertype>)*)
             | (variant (case <name> <id>? <intertype>?)*)
+            | (shared-handle <resource>)
+            | (in-buffer <intertype>)
+            | (out-buffer <intertype>)
 ```
 `f32` and `f64` are the same types that appear in `valtype` and thus `valtype`
 and `intertype` intersect at these two types. `char` is defined to be a
@@ -210,6 +215,9 @@ copy. A summary of the allowed coercions is given by the following table:
 | `list`           | if the list's element type can be coerced |
 | `record`         | if the record's fields' types can be coerced, matching fields by name regardless of order and allowing source fields to be ignored |
 | `variant`        | if the variant's cases' types can be coerced, matching cases by name regardless of order and allowing destination cases to be ignored |
+| `shared-handle`  | none |
+| `in-buffer`      | none |
+| `out-buffer`     | none |
 
 While these types are sufficiently general to capture a number of
 more-specialized types that often arise in interfaces, it can still be
@@ -1005,6 +1013,108 @@ When passing the result of `$liftMaybeAge` to `$lowerMaybeAge`, the net effect
 will be to convert from the null-or-object encoding to the packed encoding and
 then free the object in the non-null case.
 
+#### Lifting and Lowering Handles
+
+The `shared-handle` type represents a handle to resources owned by something
+else (for example the host or another external adapter module). The "shared"
+term in the name implies that the handle could be shared by a number of other
+consumers as well. Eventually interface types may also grow the concept of
+"borrowed" handles which live for only the duration of one function call or
+"unique" references where existence of the value implies unique ownership (where
+one could fallibly convert from shared to unique and infallibly convert from
+unique to shared).
+
+The `shared-handle` type is not required to be but is generally understood to
+behave somewhat similarly to a reference counted object. When a wasm module
+drops its last reference to a shared handle (for example removing it from the
+table and dropping that value) then the resource may have associated cleanup
+that runs at that time. It's expected that core wasm modules will communicate
+with their wrapper adapter module to indicate when the core wasm module no
+longer needs the handle, causing the adapter module to drop the reference to it,
+possibly triggering further cleanup.
+
+It's worth noting that `shared-handle` takes a `<resource>` in its constructor
+argument. A `<resource>` is a bit hand-wavy at the moment but it's thought of as
+a way to introduce an abstract type. A `shared-handle` to this abstract resource
+is a concrete value that can move around, whereas a `<resource>` does not expose
+its representation.
+
+Unlike all other interface types which are structurally typed, `shared-handle`
+types are nominally typed. That is, two `shared-handle` types are only
+compatible if their `<resource>` is the same. Otherwise they cannot be used
+together.
+
+All `shared-handle` resources are *unforgeable* and behave similarly to
+`externref` in the core wasm specification. Once an adapter module receives a
+`shared-handle` it can't do anything with it except move it around and pass it
+to other modules. When the original module that defined the `<resource>`
+associated with the `shared-handle` receives the handle it's guaranteed that the
+contents are the same as what it was originally created with. In this manner
+modules can use `shared-handles` to represent unforgeable state to pass to other
+modules, or is otherwise a form of capability system.
+
+The adapter instructions for `shared-handle` types are a bit hand-wavy at the
+moment. It's expected that they would loosely look like the ability to declare
+the representation of a `resource` when it's created, and then a `shared-handle`
+to that resource would create a layer of reference counting or garbage
+collection on top of those values. When the handle goes back to the original
+module that declared the `<resource>` then the module can "unwrap" the resource
+to re-acquire the underlying representation that it was originally created with.
+It's also imagined that when creating a resource you'd specify a destructor
+function to run when the resource has been determined to be no longer used by
+any other consumers.
+
+#### Lifting and Lowering Buffers
+
+The `in-buffer` and `out-buffer` types are intended to be used for passing
+buffers to a callee. The main purpose of these types, as opposed to lists, is
+that the conversion of the underlying type happens on-demand when values are
+read or written. The `in` and `out` is with reference to the perspective of a
+callee, so for example a `read` API would take an `out-buffer` as a parameter
+because the callee wants to place output into it.
+
+Buffers can only appear as parameters (transitively) because they're intended to
+be properties of the caller, and currently it wouldn't make sense for the callee
+to return some kind of buffer. Similarly an `out-buffer` cannot transitively
+contain other buffers because it's output from the callee. An `in-buffer`,
+however, can transitively contain other `in-buffer` types.
+
+For now this explainer isn't going to go into the details of hypothetical
+adapter instructions for lifting and lowering buffers. An example of buffers,
+however, are for example a `read` API:
+
+```wasm
+(adapter_module $WASI
+  (adapter_func (export "read") (param (out-buffer u8)) (result u32)
+    ;; ...
+  )
+)
+```
+
+Here the `$WASI` module exports a `read` function which takes a buffer of bytes
+and then returns a `u32` (presumably how many bytes are read). A real API would
+probably also take a file descriptor of some kind, but that's elided for now.
+
+Semantically what happens when calling this API is that the `read` function
+receives a reference to the caller's memory, but opaquely. The implementor of
+`read` only only be able to write `u8` elements into the buffer. With
+lifting/lowering instructions it's likely that this will be exposed through
+various instructions. For example the `read` implementor may call a core wasm
+import which is defined by an `adapter_func` which performs a raw canonical copy
+of the bytes from the callee's memory (in this case `$WASI`) to the caller's
+memory (whomever supplied the buffer to `read`).
+
+Buffers, in addition to a direction, will also have an optional "capacity". for
+example the `out-buffer` in `read` above would have a capacity for the maximum
+number of elements it can accept. Similarly an `in-buffer` has a capacity which
+indicates the maximum number of elements that can be read.
+
+Buffers, when passed to a callee, are a temporary reference. This means that the
+buffer object the callee receives is only valid for the duration of the function
+call. After returning if the callee later attempts to use the buffer the various
+operations on it will generate a trap. This allows callers to safely assume that
+when an API is called with a buffer it can know that the callee doesn't retain
+any internal pointers or abilities to write after the call has returned.
 
 ## An End-to-End Example
 
@@ -1115,7 +1225,7 @@ around the lack of cyclic imports.
 )
 ```
 Another thing that this example illustrates is the complementary use of
-"shared-everything" and "shared-nothing" linking described in the 
+"shared-everything" and "shared-nothing" linking described in the
 [Additional Requirements section](#additional-requirements). In particular,
 `$LIBC` is a shared-everything library that factors out the common code from
 the two shared-nothing modules `$A` and `$B`. Note that only the stateless
@@ -1192,7 +1302,7 @@ become a problem, there is a spectrum of less-aggressively-specializing
 compilation strategies available. In the limit, no inlining need be performed;
 lazy values can be boxed into tuples holding function references.
 
-As a demonstration, the adapter modules `$A` and `$B` shown in the 
+As a demonstration, the adapter modules `$A` and `$B` shown in the
 [last section](#an-end-to-end-example) would be fused into the `$fused_root`
 function shown below. The containing module would also be created according to
 similarly-automatic fusion rules. Note that the nested modules `$CORE_A` and
@@ -1416,7 +1526,7 @@ For example, the [JS API] would be extended to provide the following coercions
 (in [`ToJSValue`] and [`ToWebAssemblyValue`]):
 * Numeric types other than `s64` and `u64` convert to and from JS number values.
 * `s64` and `u64` types convert to and from JS BigInt values.
-* `string` converts to and from JS string values (using the [`DOMString`-to-`USVString`] 
+* `string` converts to and from JS string values (using the [`DOMString`-to-`USVString`]
   conversion for the "from" direction).
 * If the JS [records and tuples] proposal progresses, interface `record` and
   `list` types could convert to and from these new value types.
@@ -1562,7 +1672,7 @@ IDL APIs as built-in modules that can be directly imported.
 [Potentially ill-formed UTF-16]: http://simonsapin.github.io/wtf-8/#ill-formed-utf-16
 [WTF-16]: http://simonsapin.github.io/wtf-8/#wtf-16
 
-[Tagged Unions]: https://www.typescriptlang.org/docs/handbook/release-notes/typescript-2-0.html#tagged-union-types 
+[Tagged Unions]: https://www.typescriptlang.org/docs/handbook/release-notes/typescript-2-0.html#tagged-union-types
 [User-Defined Type Guards]: https://www.typescriptlang.org/docs/handbook/advanced-types.html#user-defined-type-guards
 [Haskell uses thunks]: https://en.wikibooks.org/wiki/Haskell/Laziness
 [Native Dynamic Linking]: https://en.wikipedia.org/wiki/Dynamic_linker
